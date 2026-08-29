@@ -1575,7 +1575,6 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     {
         uint32_t iv = g_reboot_interval_sec;
         long cur_h = iv ? (long)(iv / 3600) : 0;
-        int64_t up = (esp_timer_get_time() - boot_time_us) / 1000000;
         int64_t start = g_reboot_start_us ? g_reboot_start_us : boot_time_us;
         char next_txt[64];
         if (iv == 0) {
@@ -1594,17 +1593,18 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         httpd_resp_sendstr_chunk(req,
             "<div class=\"card\"><h2>" ICON_UPDATE " Automatic Reboot</h2>"
             "<form method=\"POST\" action=\"/reboot_interval/save\">"
-            "<div class=\"form-group\"><label class=\"label\">Interval (hours, 0/empty = disabled)</label>");
+            "<div class=\"form-group\"><label class=\"label\">Reboot interval (hours)</label>"
+            "<div class=\"text-xs text-muted\" style=\"margin-bottom:0.25rem\">Device reboots automatically after this interval. Leave empty or 0 to disable.</div>");
         snprintf(buf, sizeof(buf),
             "<input type=\"number\" name=\"hours\" min=\"1\" step=\"1\" max=\"8760\" placeholder=\"e.g. 24\" value=\"%s\" class=\"mt-1\">",
             hours_val);
         httpd_resp_sendstr_chunk(req, buf);
         snprintf(buf, sizeof(buf),
-            "<div class=\"text-xs text-muted\" style=\"margin-top:0.5rem\">Current: %s &middot; Next reboot: %s &middot; Uptime: %lld s</div>"
+            "<div class=\"text-xs text-muted\" style=\"margin-top:0.5rem\">Next reboot: %s</div>"
             "</div>"
             "<button type=\"submit\" class=\"btn btn-primary\">" ICON_SAVE " Save</button>"
             "</form></div>",
-            iv ? next_txt : "Disabled", next_txt, (long long)up);
+            next_txt);
         httpd_resp_sendstr_chunk(req, buf);
     }
 
