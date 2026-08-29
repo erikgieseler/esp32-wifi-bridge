@@ -8,6 +8,7 @@
 
 #include <string.h>
 #include <strings.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <time.h>
@@ -67,6 +68,9 @@ static const char *TAG = "wifi-eth-bridge";
 #define NVS_KEY_ETH_FORCE_DHCP "force_dhcp"
 #define NVS_KEY_ETH_FELL_BACK "fell_back"
 
+#define NVS_REBOOT_NAMESPACE "reboot"
+#define NVS_KEY_REBOOT_INTERVAL "interval"
+
 #define NVS_ADMIN_NAMESPACE "admin"
 #define NVS_KEY_ADMIN_SALT "salt"
 #define NVS_KEY_ADMIN_HASH "hash"
@@ -105,6 +109,9 @@ static int64_t boot_time_us = 0;
 
 // Connection watchdog timestamp
 static volatile int64_t last_successful_connection_time = 0;
+
+// Auto reboot interval (0 = disabled) – persisted in NVS "reboot"
+static volatile uint32_t g_reboot_interval_sec = AUTO_REBOOT_INTERVAL_SEC;
 
 // Event group for WiFi and Ethernet status
 static EventGroupHandle_t s_event_group;
@@ -790,6 +797,41 @@ static esp_err_t save_eth_config(bool use_static, const char *ip, const char *ma
         eth_cfg.using_fallback = false;
         eth_cfg.fell_back_last_boot = false;
         ESP_LOGI(TAG, "Ethernet config saved: %s", use_static ? "static" : "dhcp");
+    }
+    return err;
+}
+
+static void load_reboot_config(void)
+{
+    g_reboot_interval_sec = AUTO_REBOOT_INTERVAL_SEC;
+    nvs_handle_t h;
+    if (nvs_open(NVS_REBOOT_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        ESP_LOGI(TAG, "Auto-reboot: no saved interval (using %lus)", (unsigned long)g_reboot_interval_sec);
+        return;
+    }
+    uint32_t v = 0;
+    if (nvs_get_u32(h, NVS_KEY_REBOOT_INTERVAL, &v) == ESP_OK) {
+        g_reboot_interval_sec = v;
+    }
+    nvs_close(h);
+    ESP_LOGI(TAG, "Auto-reboot interval: %lus (%s)", (unsigned long)g_reboot_interval_sec, g_reboot_interval_sec ? "enabled" : "disabled");
+}
+
+static esp_err_t save_reboot_interval(uint32_t interval_sec)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_REBOOT_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open reboot NVS: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = nvs_set_u32(h, NVS_KEY_REBOOT_INTERVAL, interval_sec);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err == ESP_OK) {
+        g_reboot_interval_sec = interval_sec;
+        boot_time_us = esp_timer_get_time();
+        ESP_LOGI(TAG, "Auto-reboot saved: %lus", (unsigned long)interval_sec);
     }
     return err;
 }
@@ -1528,6 +1570,41 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
 
     httpd_resp_sendstr_chunk(req, "</div></div>");
 
+    // Auto reboot interval card (minimal, no API)
+    {
+        uint32_t iv = g_reboot_interval_sec;
+        long cur_h = iv ? (long)(iv / 3600) : 0;
+        int64_t up = (esp_timer_get_time() - boot_time_us) / 1000000;
+        char next_txt[64];
+        if (iv == 0) {
+            snprintf(next_txt, sizeof(next_txt), "Deaktiviert");
+        } else {
+            int64_t rem = (int64_t)iv - up;
+            if (rem < 0) rem = 0;
+            long rh = rem / 3600;
+            long rm = (rem % 3600) / 60;
+            if (rh > 0) snprintf(next_txt, sizeof(next_txt), "in %ld h %ld min", rh, rm);
+            else snprintf(next_txt, sizeof(next_txt), "in %ld min", rm);
+        }
+        char hours_val[16] = {0};
+        if (iv) snprintf(hours_val, sizeof(hours_val), "%ld", cur_h);
+        httpd_resp_sendstr_chunk(req,
+            "<div class=\"card\"><h2>" ICON_UPDATE " Automatischer Neustart</h2>"
+            "<form method=\"POST\" action=\"/reboot_interval/save\">"
+            "<div class=\"form-group\"><label class=\"label\">Intervall (Stunden, 0/leer = deaktiviert)</label>");
+        snprintf(buf, sizeof(buf),
+            "<input type=\"number\" name=\"hours\" min=\"1\" step=\"1\" max=\"8760\" placeholder=\"z.B. 24\" value=\"%s\" class=\"mt-1\">",
+            hours_val);
+        httpd_resp_sendstr_chunk(req, buf);
+        snprintf(buf, sizeof(buf),
+            "<div class=\"text-xs text-muted\" style=\"margin-top:0.5rem\">Aktuell: %s &middot; N&auml;chster Neustart: %s &middot; Uptime: %lld s</div>"
+            "</div>"
+            "<button type=\"submit\" class=\"btn btn-primary\">" ICON_SAVE " Speichern</button>"
+            "</form></div>",
+            iv ? next_txt : "Deaktiviert", next_txt, (long long)up);
+        httpd_resp_sendstr_chunk(req, buf);
+    }
+
     // Firmware card (at bottom)
     httpd_resp_sendstr_chunk(req,
         "<div class=\"card\"><h2>" ICON_UPDATE " Firmware</h2><div class=\"grid\">");
@@ -1960,6 +2037,73 @@ static esp_err_t eth_save_handler(httpd_req_t *req)
 
     vTaskDelay(pdMS_TO_TICKS(800));
     esp_restart();
+    return ESP_OK;
+}
+
+/** Auto reboot interval save – hours input (0/empty = disabled) */
+static esp_err_t reboot_interval_save_handler(httpd_req_t *req)
+{
+    char content[64];
+    int received = httpd_req_recv(req, content, sizeof(content) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No data");
+        return ESP_FAIL;
+    }
+    content[received] = '\0';
+
+    char hours_str[16] = {0};
+    form_get(content, "hours", hours_str, sizeof(hours_str));
+
+    // Trim spaces
+    char *p = hours_str;
+    while (*p == ' ' || *p == '\t') p++;
+    uint32_t interval_sec = 0;
+    if (p[0] != '\0') {
+        char *end = NULL;
+        long hours = strtol(p, &end, 10);
+        if (end == p || (end && *end != '\0') || hours < 0 || hours > 8760) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid hours (0..8760)");
+            return ESP_FAIL;
+        }
+        if (hours != 0 && hours < 1) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Min 1 hour or 0 to disable");
+            return ESP_FAIL;
+        }
+        if (hours > 0 && (uint64_t)hours * 3600ULL > 0xFFFFFFFFULL) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Too large");
+            return ESP_FAIL;
+        }
+        interval_sec = (uint32_t)(hours * 3600);
+        if (interval_sec != 0 && interval_sec < 3600) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Min 1 hour");
+            return ESP_FAIL;
+        }
+    }
+
+    if (save_reboot_interval(interval_sec) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save");
+        return ESP_FAIL;
+    }
+
+    char resp[768];
+    if (interval_sec == 0) {
+        snprintf(resp, sizeof(resp),
+            "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
+            "<meta http-equiv=\"refresh\" content=\"5;url=/\">"
+            "<style>body{font-family:system-ui;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}"
+            ".box{background:#1e293b;padding:2rem;border-radius:0.75rem;text-align:center;border:1px solid #334155}</style></head>"
+            "<body><div class=\"box\"><h2>Auto-Reboot deaktiviert</h2><p>Intervall gelöscht. Weiterleitung in 5s...</p><p><a href=\"/\" style=\"color:#3b82f6\">Zurück</a></p></div></body></html>");
+    } else {
+        long h = interval_sec / 3600;
+        snprintf(resp, sizeof(resp),
+            "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
+            "<meta http-equiv=\"refresh\" content=\"5;url=/\">"
+            "<style>body{font-family:system-ui;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}"
+            ".box{background:#1e293b;padding:2rem;border-radius:0.75rem;text-align:center;border:1px solid #334155}</style></head>"
+            "<body><div class=\"box\"><h2>Auto-Reboot gespeichert</h2><p>Neustart alle <strong>%ld Stunden</strong>. Timer neu gestartet.</p><p>Weiterleitung in 5s...</p><p><a href=\"/\" style=\"color:#3b82f6\">Zurück</a></p></div></body></html>", h);
+    }
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, resp, strlen(resp));
     return ESP_OK;
 }
 
@@ -2719,7 +2863,7 @@ static esp_err_t start_http_server(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = WEB_HTTP_PORT;
     config.stack_size = 8192;
-    config.max_uri_handlers = 28;
+    config.max_uri_handlers = 29;
     config.lru_purge_enable = true;
     config.open_fn = http_open_fn;
 
@@ -2775,6 +2919,7 @@ static esp_err_t start_http_server(void)
     AUTH_URI("/ota/upload", HTTP_POST, ota_upload_handler);
     AUTH_URI("/ota/rollback", HTTP_POST, ota_rollback_handler);
     AUTH_URI("/reboot", HTTP_POST, reboot_handler);
+    AUTH_URI("/reboot_interval/save", HTTP_POST, reboot_interval_save_handler);
     AUTH_URI("/wifi/scan", HTTP_GET, wifi_scan_handler);
     AUTH_URI("/wifi/save", HTTP_POST, wifi_save_handler);
     AUTH_URI("/eth/save", HTTP_POST, eth_save_handler);
@@ -3266,6 +3411,26 @@ static void connection_watchdog_task(void *pvParameters)
     }
 }
 
+/** Auto reboot by interval (0 = disabled) */
+static void auto_reboot_task(void *pvParameters)
+{
+    (void)pvParameters;
+    ESP_LOGI(TAG, "Auto-reboot task started (interval %lus, check %ds)",
+             (unsigned long)g_reboot_interval_sec, AUTO_REBOOT_CHECK_INTERVAL_SEC);
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(AUTO_REBOOT_CHECK_INTERVAL_SEC * 1000));
+        uint32_t interval = g_reboot_interval_sec;
+        if (interval == 0) continue;
+        int64_t elapsed_sec = (esp_timer_get_time() - boot_time_us) / 1000000;
+        if (elapsed_sec >= (int64_t)interval) {
+            ESP_LOGW(TAG, "Auto-reboot: %lld s elapsed (interval %lu s) – rebooting",
+                     (long long)elapsed_sec, (unsigned long)interval);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+        }
+    }
+}
+
 // Proxy tasks are in proxy.c
 
 /** Task to initialize WiFi-dependent services after connection */
@@ -3332,6 +3497,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     load_admin_config();
+    load_reboot_config();
     init_temp_sensor();
     sample_chip_temp();
 
@@ -3380,6 +3546,9 @@ void app_main(void)
 
     // Start connection watchdog task
     xTaskCreate(connection_watchdog_task, "conn_watchdog", 3072, NULL, 3, NULL);
+
+    // Auto reboot by interval
+    xTaskCreate(auto_reboot_task, "auto_reboot", 2048, NULL, 3, NULL);
 
     // Start WiFi-dependent services in background task
     // This allows OTA to remain responsive while waiting for WiFi
