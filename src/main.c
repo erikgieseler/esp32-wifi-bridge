@@ -112,6 +112,7 @@ static volatile int64_t last_successful_connection_time = 0;
 
 // Auto reboot interval (0 = disabled) – persisted in NVS "reboot"
 static volatile uint32_t g_reboot_interval_sec = AUTO_REBOOT_INTERVAL_SEC;
+static int64_t g_reboot_start_us = 0;
 
 // Event group for WiFi and Ethernet status
 static EventGroupHandle_t s_event_group;
@@ -804,6 +805,7 @@ static esp_err_t save_eth_config(bool use_static, const char *ip, const char *ma
 static void load_reboot_config(void)
 {
     g_reboot_interval_sec = AUTO_REBOOT_INTERVAL_SEC;
+    g_reboot_start_us = boot_time_us;
     nvs_handle_t h;
     if (nvs_open(NVS_REBOOT_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
         ESP_LOGI(TAG, "Auto-reboot: no saved interval (using %lus)", (unsigned long)g_reboot_interval_sec);
@@ -830,7 +832,7 @@ static esp_err_t save_reboot_interval(uint32_t interval_sec)
     nvs_close(h);
     if (err == ESP_OK) {
         g_reboot_interval_sec = interval_sec;
-        boot_time_us = esp_timer_get_time();
+        g_reboot_start_us = esp_timer_get_time();
         ESP_LOGI(TAG, "Auto-reboot saved: %lus", (unsigned long)interval_sec);
     }
     return err;
@@ -1575,11 +1577,13 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         uint32_t iv = g_reboot_interval_sec;
         long cur_h = iv ? (long)(iv / 3600) : 0;
         int64_t up = (esp_timer_get_time() - boot_time_us) / 1000000;
+        int64_t start = g_reboot_start_us ? g_reboot_start_us : boot_time_us;
         char next_txt[64];
         if (iv == 0) {
-            snprintf(next_txt, sizeof(next_txt), "Deaktiviert");
+            snprintf(next_txt, sizeof(next_txt), "Disabled");
         } else {
-            int64_t rem = (int64_t)iv - up;
+            int64_t elapsed = (esp_timer_get_time() - start) / 1000000;
+            int64_t rem = (int64_t)iv - elapsed;
             if (rem < 0) rem = 0;
             long rh = rem / 3600;
             long rm = (rem % 3600) / 60;
@@ -1589,19 +1593,19 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         char hours_val[16] = {0};
         if (iv) snprintf(hours_val, sizeof(hours_val), "%ld", cur_h);
         httpd_resp_sendstr_chunk(req,
-            "<div class=\"card\"><h2>" ICON_UPDATE " Automatischer Neustart</h2>"
+            "<div class=\"card\"><h2>" ICON_UPDATE " Automatic Reboot</h2>"
             "<form method=\"POST\" action=\"/reboot_interval/save\">"
-            "<div class=\"form-group\"><label class=\"label\">Intervall (Stunden, 0/leer = deaktiviert)</label>");
+            "<div class=\"form-group\"><label class=\"label\">Interval (hours, 0/empty = disabled)</label>");
         snprintf(buf, sizeof(buf),
-            "<input type=\"number\" name=\"hours\" min=\"1\" step=\"1\" max=\"8760\" placeholder=\"z.B. 24\" value=\"%s\" class=\"mt-1\">",
+            "<input type=\"number\" name=\"hours\" min=\"1\" step=\"1\" max=\"8760\" placeholder=\"e.g. 24\" value=\"%s\" class=\"mt-1\">",
             hours_val);
         httpd_resp_sendstr_chunk(req, buf);
         snprintf(buf, sizeof(buf),
-            "<div class=\"text-xs text-muted\" style=\"margin-top:0.5rem\">Aktuell: %s &middot; N&auml;chster Neustart: %s &middot; Uptime: %lld s</div>"
+            "<div class=\"text-xs text-muted\" style=\"margin-top:0.5rem\">Current: %s &middot; Next reboot: %s &middot; Uptime: %lld s</div>"
             "</div>"
-            "<button type=\"submit\" class=\"btn btn-primary\">" ICON_SAVE " Speichern</button>"
+            "<button type=\"submit\" class=\"btn btn-primary\">" ICON_SAVE " Save</button>"
             "</form></div>",
-            iv ? next_txt : "Deaktiviert", next_txt, (long long)up);
+            iv ? next_txt : "Disabled", next_txt, (long long)up);
         httpd_resp_sendstr_chunk(req, buf);
     }
 
@@ -2092,7 +2096,7 @@ static esp_err_t reboot_interval_save_handler(httpd_req_t *req)
             "<meta http-equiv=\"refresh\" content=\"5;url=/\">"
             "<style>body{font-family:system-ui;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}"
             ".box{background:#1e293b;padding:2rem;border-radius:0.75rem;text-align:center;border:1px solid #334155}</style></head>"
-            "<body><div class=\"box\"><h2>Auto-Reboot deaktiviert</h2><p>Intervall gelöscht. Weiterleitung in 5s...</p><p><a href=\"/\" style=\"color:#3b82f6\">Zurück</a></p></div></body></html>");
+            "<body><div class=\"box\"><h2>Auto-Reboot disabled</h2><p>Interval cleared. Redirecting in 5s...</p><p><a href=\"/\" style=\"color:#3b82f6\">Back</a></p></div></body></html>");
     } else {
         long h = interval_sec / 3600;
         snprintf(resp, sizeof(resp),
@@ -2100,7 +2104,7 @@ static esp_err_t reboot_interval_save_handler(httpd_req_t *req)
             "<meta http-equiv=\"refresh\" content=\"5;url=/\">"
             "<style>body{font-family:system-ui;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}"
             ".box{background:#1e293b;padding:2rem;border-radius:0.75rem;text-align:center;border:1px solid #334155}</style></head>"
-            "<body><div class=\"box\"><h2>Auto-Reboot gespeichert</h2><p>Neustart alle <strong>%ld Stunden</strong>. Timer neu gestartet.</p><p>Weiterleitung in 5s...</p><p><a href=\"/\" style=\"color:#3b82f6\">Zurück</a></p></div></body></html>", h);
+            "<body><div class=\"box\"><h2>Auto-Reboot saved</h2><p>Reboot every <strong>%ld hours</strong>. Timer restarted.</p><p>Redirecting in 5s...</p><p><a href=\"/\" style=\"color:#3b82f6\">Back</a></p></div></body></html>", h);
     }
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, resp, strlen(resp));
@@ -3415,13 +3419,15 @@ static void connection_watchdog_task(void *pvParameters)
 static void auto_reboot_task(void *pvParameters)
 {
     (void)pvParameters;
+    if (g_reboot_start_us == 0) g_reboot_start_us = boot_time_us;
     ESP_LOGI(TAG, "Auto-reboot task started (interval %lus, check %ds)",
              (unsigned long)g_reboot_interval_sec, AUTO_REBOOT_CHECK_INTERVAL_SEC);
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(AUTO_REBOOT_CHECK_INTERVAL_SEC * 1000));
         uint32_t interval = g_reboot_interval_sec;
         if (interval == 0) continue;
-        int64_t elapsed_sec = (esp_timer_get_time() - boot_time_us) / 1000000;
+        if (g_reboot_start_us == 0) continue;
+        int64_t elapsed_sec = (esp_timer_get_time() - g_reboot_start_us) / 1000000;
         if (elapsed_sec >= (int64_t)interval) {
             ESP_LOGW(TAG, "Auto-reboot: %lld s elapsed (interval %lu s) – rebooting",
                      (long long)elapsed_sec, (unsigned long)interval);
