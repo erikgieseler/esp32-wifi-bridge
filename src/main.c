@@ -8,7 +8,6 @@
 
 #include <string.h>
 #include <strings.h>
-#include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <time.h>
@@ -2058,30 +2057,27 @@ static esp_err_t reboot_interval_save_handler(httpd_req_t *req)
     char hours_str[16] = {0};
     form_get(content, "hours", hours_str, sizeof(hours_str));
 
-    // Trim spaces
+    // Trim spaces and parse decimal hours manually (no stdlib)
     char *p = hours_str;
     while (*p == ' ' || *p == '\t') p++;
     uint32_t interval_sec = 0;
     if (p[0] != '\0') {
-        char *end = NULL;
-        long hours = strtol(p, &end, 10);
-        if (end == p || (end && *end != '\0') || hours < 0 || hours > 8760) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid hours (0..8760)");
-            return ESP_FAIL;
-        }
-        if (hours != 0 && hours < 1) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Min 1 hour or 0 to disable");
-            return ESP_FAIL;
-        }
-        if (hours > 0 && (uint64_t)hours * 3600ULL > 0xFFFFFFFFULL) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Too large");
-            return ESP_FAIL;
+        // Trim trailing spaces
+        char *t = p + strlen(p) - 1;
+        while (t > p && (*t == ' ' || *t == '\t')) { *t = '\0'; t--; }
+        long hours = 0;
+        for (char *q = p; *q; q++) {
+            if (*q < '0' || *q > '9') {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid hours (0..8760)");
+                return ESP_FAIL;
+            }
+            hours = hours * 10 + (*q - '0');
+            if (hours > 8760) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid hours (0..8760)");
+                return ESP_FAIL;
+            }
         }
         interval_sec = (uint32_t)(hours * 3600);
-        if (interval_sec != 0 && interval_sec < 3600) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Min 1 hour");
-            return ESP_FAIL;
-        }
     }
 
     if (save_reboot_interval(interval_sec) != ESP_OK) {
