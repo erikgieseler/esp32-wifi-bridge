@@ -141,6 +141,15 @@
 #define WATCHDOG_CHECK_INTERVAL_SEC 60  // Check every minute
 #endif
 
+// ===== Auto Reboot (interval) =====
+// Periodic reboot every N seconds (0 = disabled). GUI: hours input (0 = off)
+#ifndef AUTO_REBOOT_INTERVAL_SEC
+#define AUTO_REBOOT_INTERVAL_SEC 0
+#endif
+#ifndef AUTO_REBOOT_CHECK_INTERVAL_SEC
+#define AUTO_REBOOT_CHECK_INTERVAL_SEC 60
+#endif
+
 // ===== Debug Configuration =====
 // Enable DEBUG_MODE to show encrypted packet forwarding details
 #ifndef DEBUG_MODE
