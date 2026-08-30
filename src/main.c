@@ -8,6 +8,7 @@
 
 #include <string.h>
 #include <strings.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <time.h>
@@ -49,6 +50,68 @@
 #include "proxy.h"
 #include "remote_ota.h"
 #include "wifi_metrics.h"
+#include "i18n.h"
+#include "i18n_keys.h"
+#include "i18n_data.h"
+
+// Chunk translation helper – replaces EN substrings with DE when LANG_DE
+static esp_err_t httpd_resp_sendstr_chunk_tr(httpd_req_t *req, const char *str) {
+    if (!str) return httpd_resp_sendstr_chunk(req, NULL);
+    lang_t lang = i18n_get_current();
+    if (lang == LANG_EN) return httpd_resp_sendstr_chunk(req, str);
+    // Build replacement list on the fly (EN -> DE) sorted by length desc for longest match
+    // We use I18N_KEYS / I18N_TABLE from i18n_data.h
+    size_t in_len = strlen(str);
+    size_t out_cap = in_len * 3 + 1024;
+    char *out = malloc(out_cap);
+    if (!out) return httpd_resp_sendstr_chunk(req, str);
+    size_t oi = 0;
+    for (size_t i = 0; i < in_len; ) {
+        bool replaced = false;
+        // Try all keys – find longest en that matches at i
+        int best_idx = -1;
+        size_t best_len = 0;
+        for (int k = 0; k < I18N_KEY_COUNT; k++) {
+            const char *en = I18N_TABLE[LANG_EN][k];
+            const char *de = I18N_TABLE[LANG_DE][k];
+            if (!en || !en[0] || !de || !de[0] || strcmp(en, de) == 0) continue;
+            size_t el = strlen(en);
+            if (el < 2) continue;
+            if (i + el <= in_len && strncmp(str + i, en, el) == 0) {
+                if (el > best_len) { best_len = el; best_idx = k; }
+            }
+        }
+        if (best_idx >= 0) {
+            const char *de = I18N_TABLE[LANG_DE][best_idx];
+            size_t dl = strlen(de);
+            if (oi + dl + 1 >= out_cap) {
+                size_t new_cap = out_cap + dl + 1024;
+                char *no = realloc(out, new_cap);
+                if (!no) { free(out); return httpd_resp_sendstr_chunk(req, str); }
+                out = no;
+                out_cap = new_cap;
+            }
+            memcpy(out + oi, de, dl);
+            oi += dl;
+            i += best_len;
+            replaced = true;
+        }
+        if (!replaced) {
+            if (oi + 1 >= out_cap) {
+                size_t new_cap = out_cap + 1024;
+                char *no = realloc(out, new_cap);
+                if (!no) { free(out); return httpd_resp_sendstr_chunk(req, str); }
+                out = no;
+                out_cap = new_cap;
+            }
+            out[oi++] = str[i++];
+        }
+    }
+    out[oi] = '\0';
+    esp_err_t ret = httpd_resp_sendstr_chunk(req, out);
+    free(out);
+    return ret;
+}
 
 static const char *TAG = "wifi-eth-bridge";
 
@@ -1217,32 +1280,50 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    {
+        const char *hl = (i18n_get_current() == LANG_DE ? "de" : "en");
+        httpd_resp_set_hdr(req, "Content-Language", hl);
+    }
 
     // Send HTML head and CSS separately (CSS is too large for single buffer)
-    httpd_resp_sendstr_chunk(req,
-        "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        "<link rel=\"icon\" type=\"image/png\" href=\"/favicon.ico\">"
-        "<link rel=\"apple-touch-icon\" href=\"/apple-touch-icon.png\">"
-        "<title>ESP32 WiFi Bridge</title><style>");
-    httpd_resp_sendstr_chunk(req, DARK_CSS);
-    httpd_resp_sendstr_chunk(req,
+    {
+        const char *hl = (i18n_get_current() == LANG_DE ? "de" : "en");
+        char head[384];
+        snprintf(head, sizeof(head),
+            "<!DOCTYPE html><html lang=\"%s\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<link rel=\"icon\" type=\"image/png\" href=\"/favicon.ico\">"
+            "<link rel=\"apple-touch-icon\" href=\"/apple-touch-icon.png\">"
+            "<title>ESP32 WiFi Bridge</title><style>", hl);
+        httpd_resp_sendstr_chunk_tr(req, head);
+    }
+     httpd_resp_sendstr_chunk_tr(req, DARK_CSS);
+    httpd_resp_sendstr_chunk_tr(req,
         "svg.i{width:1.125rem;height:1.125rem;vertical-align:middle;margin-right:0.25rem;fill:currentColor}"
         "</style></head><body><div class=\"container\">");
 
-    char buf[512];
+    char buf[768];
 
-    // Status card - header
-    httpd_resp_sendstr_chunk(req, "<div class=\"card\"><h1>" ICON_ROUTER " ESP32 WiFi Bridge</h1><div class=\"grid\">");
+    // Status card - header with language switcher (NVS-only, reboot)
+    {
+        const char *sel_en = (i18n_get_current() == LANG_EN ? " selected" : "");
+        const char *sel_de = (i18n_get_current() == LANG_DE ? " selected" : "");
+        snprintf(buf, sizeof(buf),
+            "<div class=\"card\"><div class=\"flex\" style=\"justify-content:space-between;align-items:center\"><h1>" ICON_ROUTER " ESP32 WiFi Bridge</h1>"
+            "<form method=\"POST\" action=\"/lang\" style=\"margin:0\"><select name=\"lang\" onchange=\"this.form.submit()\" style=\"width:auto;padding:0.25rem;font-size:0.75rem\">"
+            "<option value=\"en\"%s>English</option><option value=\"de\"%s>Deutsch</option></select></form></div><div class=\"grid\">",
+            sel_en, sel_de);
+        httpd_resp_sendstr_chunk_tr(req, buf);
+    }
 
     // WiFi status (clickable to show/hide WiFi config)
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<div class=\"status-item\" style=\"cursor:pointer\" onclick=\"document.getElementById('wificfg').style.display=document.getElementById('wificfg').style.display==='none'?'block':'none'\">"
         "<div class=\"label\">" ICON_WIFI " WiFi " ICON_SETTINGS "</div>");
     snprintf(buf, sizeof(buf),
         "<div class=\"value\"><span class=\"status-dot %s\"></span>%s</div></div>",
         wifi_connected ? "status-ok" : "status-err",
         wifi_connected ? "Connected" : "Disconnected");
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
 
     // Signal strength (with ID for auto-refresh, colored by quality)
     if (wifi_connected) {
@@ -1256,7 +1337,7 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         snprintf(buf, sizeof(buf),
             "<div class=\"status-item\"><div class=\"label\">" ICON_SIGNAL " Signal</div><div class=\"value\" id=\"sig\">-</div></div>");
     }
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
 
     // Powerwall status
     snprintf(buf, sizeof(buf),
@@ -1264,16 +1345,16 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         "<div class=\"value\"><span class=\"status-dot %s\"></span>%s</div></div>",
         powerwall_reachable ? "status-ok" : "status-err",
         powerwall_reachable ? "Reachable" : "Unreachable");
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
 
     // Target IP
     snprintf(buf, sizeof(buf),
         "<div class=\"status-item\"><div class=\"label\">" ICON_DNS " Target</div><div class=\"value\">%s</div></div>",
         POWERWALL_IP_STR);
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
 
     // Ethernet IP (clickable to show/hide Ethernet config)
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<div class=\"status-item\" style=\"cursor:pointer\" onclick=\"document.getElementById('ethcfg').style.display=document.getElementById('ethcfg').style.display==='none'?'block':'none'\">"
         "<div class=\"label\">" ICON_LAN " Ethernet " ICON_SETTINGS "</div>");
     snprintf(buf, sizeof(buf),
@@ -1281,25 +1362,25 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         "<div class=\"text-xs text-muted\">%s</div></div>"
         "</div></div>",
         eth_ip_str, eth_mode_label);
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
 
     // WiFi Configuration card (hidden by default, toggle via WiFi Status click)
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<div class=\"card\" id=\"wificfg\" style=\"display:none\"><h2>" ICON_SETTINGS " WiFi Configuration</h2>"
         "<form method=\"POST\" action=\"/wifi/save\">"
         "<div class=\"form-group\"><label class=\"label\">Network SSID</label>");
 
     snprintf(buf, sizeof(buf),
         "<input type=\"text\" name=\"ssid\" id=\"ssid\" value=\"%s\" placeholder=\"Enter SSID\" class=\"mt-1\">", wifi_ssid);
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
 
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<div class=\"flex mt-1\">"
         "<button type=\"button\" class=\"btn btn-secondary\" onclick=\"scanWifi()\">" ICON_SEARCH " Scan</button>"
         "<select id=\"wl\" style=\"display:none;flex:1\" onchange=\"document.getElementById('ssid').value=this.value\"></select>"
         "</div></div>");
 
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<div class=\"form-group\"><label class=\"label\">Password</label>"
         "<input type=\"password\" name=\"password\" placeholder=\"Enter password\" class=\"mt-1\"></div>");
 
@@ -1307,18 +1388,18 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         "<div class=\"text-xs text-muted\" style=\"margin-bottom:0.75rem\">Current: %s</div>"
         "<button type=\"submit\" class=\"btn btn-primary\">" ICON_SAVE " Save &amp; Reconnect</button>"
         "</form></div>", wifi_ssid);
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
 
     // Ethernet Configuration card (hidden by default, toggle via Ethernet status click)
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<div class=\"card\" id=\"ethcfg\" style=\"display:none\"><h2>" ICON_LAN " Ethernet Configuration</h2>");
     if (eth_cfg.using_fallback || eth_cfg.fell_back_last_boot) {
-        httpd_resp_sendstr_chunk(req,
+        httpd_resp_sendstr_chunk_tr(req,
             "<div class=\"alert alert-warn\" style=\"margin-bottom:0.75rem\">" ICON_WARN
             " Fell back to DHCP because the static gateway was unreachable. "
             "Saved static settings are unchanged. Save again to retry, or switch to DHCP.</div>");
     }
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<form method=\"POST\" action=\"/eth/save\">"
         "<div class=\"form-group\"><label class=\"label\">Address mode</label>"
         "<select name=\"mode\" id=\"ethmode\" onchange=\"toggleEthMode()\" class=\"mt-1\">");
@@ -1327,30 +1408,30 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         "<option value=\"static\"%s>Static IP</option></select></div>",
         eth_cfg.use_static ? "" : " selected",
         eth_cfg.use_static ? " selected" : "");
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
 
     snprintf(buf, sizeof(buf),
         "<div id=\"ethstatic\" style=\"display:%s\">"
         "<div class=\"form-group\"><label class=\"label\">IP address</label>"
         "<input type=\"text\" name=\"ip\" value=\"%s\" placeholder=\"192.168.1.50\" class=\"mt-1\"></div>",
         eth_cfg.use_static ? "block" : "none", form_ip);
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
     snprintf(buf, sizeof(buf),
         "<div class=\"form-group\"><label class=\"label\">Subnet mask</label>"
         "<input type=\"text\" name=\"netmask\" value=\"%s\" placeholder=\"255.255.255.0\" class=\"mt-1\"></div>",
         form_mask);
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
     snprintf(buf, sizeof(buf),
         "<div class=\"form-group\"><label class=\"label\">Gateway</label>"
         "<input type=\"text\" name=\"gateway\" value=\"%s\" placeholder=\"192.168.1.1\" class=\"mt-1\"></div>",
         form_gw);
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
     snprintf(buf, sizeof(buf),
         "<div class=\"form-group\"><label class=\"label\">DNS</label>"
         "<input type=\"text\" name=\"dns\" value=\"%s\" placeholder=\"192.168.1.1\" class=\"mt-1\"></div>"
         "</div>", form_dns);
-    httpd_resp_sendstr_chunk(req, buf);
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req, buf);
+    httpd_resp_sendstr_chunk_tr(req,
         "<div class=\"text-xs text-muted\" style=\"margin-bottom:0.75rem\">"
         "Device reboots to apply. If the gateway is unreachable for 45s with no LAN traffic, "
         "it falls back to DHCP. Hold BOOT 15 seconds to force DHCP and clear the admin password.</div>"
@@ -1363,22 +1444,22 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     if (chip_temp_ok) {
         snprintf(temp_disp, sizeof(temp_disp), "%.1f °C", (double)chip_temp_c);
     }
-    httpd_resp_sendstr_chunk(req, "<div class=\"card\"><h2>" ICON_MEMORY " System</h2><div class=\"grid\">");
+    httpd_resp_sendstr_chunk_tr(req, "<div class=\"card\"><h2>" ICON_MEMORY " System</h2><div class=\"grid\">");
     snprintf(buf, sizeof(buf),
         "<div class=\"status-item\"><div class=\"label\">CPU</div><div class=\"value\" id=\"cpu\">%u%%</div></div>"
         "<div class=\"status-item\"><div class=\"label\">Chip temp</div>"
         "<div class=\"value\" id=\"temp\" style=\"color:%s\">%s</div></div>",
         cpu_usage_percent, chip_temp_color(), temp_disp);
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
     snprintf(buf, sizeof(buf),
         "<div class=\"status-item\"><div class=\"label\">Heap</div><div class=\"value\">%lu KB</div></div>"
         "<div class=\"status-item\"><div class=\"label\">WiFi IP</div><div class=\"value\">%s</div></div>",
         (unsigned long)(esp_get_free_heap_size() / 1024), ip_str);
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
     snprintf(buf, sizeof(buf),
         "<div class=\"status-item\"><div class=\"label\">Ethernet IP</div><div class=\"value\" id=\"ethip2\">%s</div></div>",
         eth_ip_str);
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
     {
         char wd_disp[40];
         const char *wd_color;
@@ -1404,9 +1485,9 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
             "<div class=\"status-item\"><div class=\"label\">Watchdog</div>"
             "<div class=\"value\" id=\"wdog\" style=\"color:%s\">%s</div></div></div>",
             wd_color, wd_disp);
-        httpd_resp_sendstr_chunk(req, buf);
+        httpd_resp_sendstr_chunk_tr(req, buf);
     }
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<hr><div class=\"flex\" style=\"gap:0.5rem;flex-wrap:wrap\">"
         "<form id=\"rebootform\" method=\"POST\" action=\"/reboot\">"
         "<button type=\"button\" class=\"btn btn-secondary\" onclick=\"if(confirm('Reboot device?'))document.getElementById('rebootform').submit()\">"
@@ -1452,28 +1533,28 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         else if (bytes_out_fmt >= 1048576) { bytes_out_fmt /= 1048576; out_unit = "MB"; }
         else if (bytes_out_fmt >= 1024) { bytes_out_fmt /= 1024; out_unit = "KB"; }
 
-        httpd_resp_sendstr_chunk(req, "<div class=\"card\"><h2>" ICON_SWAP " Statistics</h2><div class=\"grid\">");
+        httpd_resp_sendstr_chunk_tr(req, "<div class=\"card\"><h2>" ICON_SWAP " Statistics</h2><div class=\"grid\">");
         snprintf(buf, sizeof(buf),
             "<div class=\"status-item\"><div class=\"label\">Uptime</div><div class=\"value\" id=\"uptime\">%dd %dh %dm %ds</div></div>"
             "<div class=\"status-item\"><div class=\"label\">Requests</div><div class=\"value\" id=\"reqcnt\">%lu</div></div>",
             days, hours, mins, secs, (unsigned long)stats.total_requests);
-        httpd_resp_sendstr_chunk(req, buf);
+        httpd_resp_sendstr_chunk_tr(req, buf);
         snprintf(buf, sizeof(buf),
             "<div class=\"status-item\"><div class=\"label\">Success Rate</div><div class=\"value\" id=\"succrate\" style=\"color:%s\">%lu%%</div></div>"
             "<div class=\"status-item\"><div class=\"label\">Failed</div><div class=\"value\" id=\"failcnt\" style=\"color:#ef4444\">%lu</div></div>",
             success_rate >= 90 ? "#22c55e" : success_rate >= 70 ? "#eab308" : "#ef4444",
             (unsigned long)success_rate, (unsigned long)stats.failed_requests);
-        httpd_resp_sendstr_chunk(req, buf);
+        httpd_resp_sendstr_chunk_tr(req, buf);
         snprintf(buf, sizeof(buf),
             "<div class=\"status-item\"><div class=\"label\">Bytes In</div><div class=\"value\" id=\"bytesin\">%.1f %s</div></div>"
             "<div class=\"status-item\"><div class=\"label\">Bytes Out</div><div class=\"value\" id=\"bytesout\">%.1f %s</div></div>",
             bytes_in_fmt, in_unit, bytes_out_fmt, out_unit);
-        httpd_resp_sendstr_chunk(req, buf);
-        httpd_resp_sendstr_chunk(req, "</div></div>");
+        httpd_resp_sendstr_chunk_tr(req, buf);
+        httpd_resp_sendstr_chunk_tr(req, "</div></div>");
     }
 
     // WiFi History Chart card
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<div class=\"card\"><h2>" ICON_CHART " WiFi Signal History <span id=\"chspan\" class=\"text-muted text-xs\">(since boot)</span></h2>"
         "<div class=\"chart-container\"><canvas id=\"wifichart\"></canvas></div>"
         "<div class=\"chart-legend\">"
@@ -1484,14 +1565,14 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         "</div>");
 
     // Recent requests card with TTFB (IDs for auto-refresh)
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<div class=\"card\"><h2>" ICON_SWAP " Recent Requests</h2>"
         "<div class=\"flex\" style=\"justify-content:space-between;margin-bottom:0.5rem\">");
     snprintf(buf, sizeof(buf),
         "<span class=\"text-sm text-muted\">Avg TTFB: <span id=\"avgttfb\">%lu</span> ms</span>",
         (unsigned long)proxy_get_avg_ttfb());
-    httpd_resp_sendstr_chunk(req, buf);
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req, buf);
+    httpd_resp_sendstr_chunk_tr(req,
         "<span class=\"text-xs text-muted\">Updated: <span id=\"lastref\">now</span></span></div>"
         "<table style=\"width:100%;font-size:0.875rem\">"
         "<tr style=\"color:#94a3b8\"><td>Age</td><td>Source</td><td>Req/Resp</td><td>Response</td><td>Status</td></tr>"
@@ -1524,14 +1605,14 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
                 ip[0], ip[1], ip[2], ip[3],
                 (unsigned long)e->bytes_in, (unsigned long)e->bytes_out,
                 e->ttfb_ms, e->ttlb_ms, color, status);
-            httpd_resp_sendstr_chunk(req, buf);
+            httpd_resp_sendstr_chunk_tr(req, buf);
         }
     }
 
-    httpd_resp_sendstr_chunk(req, "</tbody></table></div>");
+    httpd_resp_sendstr_chunk_tr(req, "</tbody></table></div>");
 
     // Log Viewer card
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<div class=\"card\"><div class=\"flex\" style=\"justify-content:space-between;align-items:center;margin-bottom:0.5rem\">"
         "<h2 style=\"margin:0\">" ICON_MEMORY " System Logs</h2>"
         "<button type=\"button\" class=\"btn btn-secondary\" onclick=\"dlLogs()\">Download</button></div>"
@@ -1564,12 +1645,12 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
 
             snprintf(buf, sizeof(buf),
                 "<div style=\"color:%s;white-space:pre-wrap;word-break:break-word\">%s</div>", color, escaped);
-            httpd_resp_sendstr_chunk(req, buf);
+            httpd_resp_sendstr_chunk_tr(req, buf);
         }
         xSemaphoreGive(log_mutex);
     }
 
-    httpd_resp_sendstr_chunk(req, "</div></div>");
+    httpd_resp_sendstr_chunk_tr(req, "</div></div>");
 
     // Auto reboot interval card (minimal, no API)
     {
@@ -1590,7 +1671,7 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         }
         char hours_val[16] = {0};
         if (iv) snprintf(hours_val, sizeof(hours_val), "%ld", cur_h);
-        httpd_resp_sendstr_chunk(req,
+        httpd_resp_sendstr_chunk_tr(req,
             "<div class=\"card\"><h2>" ICON_UPDATE " Automatic Reboot</h2>"
             "<form method=\"POST\" action=\"/reboot_interval/save\">"
             "<div class=\"form-group\"><label class=\"label\">Reboot interval (hours)</label>"
@@ -1598,25 +1679,25 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         snprintf(buf, sizeof(buf),
             "<input type=\"number\" name=\"hours\" min=\"1\" step=\"1\" max=\"8760\" placeholder=\"e.g. 24\" value=\"%s\" class=\"mt-1\">",
             hours_val);
-        httpd_resp_sendstr_chunk(req, buf);
+        httpd_resp_sendstr_chunk_tr(req, buf);
         snprintf(buf, sizeof(buf),
             "<div class=\"text-xs text-muted\" style=\"margin-top:0.5rem\">Next reboot: %s</div>"
             "</div>"
             "<button type=\"submit\" class=\"btn btn-primary\">" ICON_SAVE " Save</button>"
             "</form></div>",
             next_txt);
-        httpd_resp_sendstr_chunk(req, buf);
+        httpd_resp_sendstr_chunk_tr(req, buf);
     }
 
     // Firmware card (at bottom)
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<div class=\"card\"><h2>" ICON_UPDATE " Firmware</h2><div class=\"grid\">");
 
     snprintf(buf, sizeof(buf),
         "<div class=\"status-item\"><div class=\"label\">Version</div><div class=\"value\">%s</div></div>"
         "<div class=\"status-item\"><div class=\"label\">Built</div><div class=\"value text-sm\">%s</div></div>",
         app_desc->version, app_desc->date);
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
 
     snprintf(buf, sizeof(buf),
         "<div class=\"status-item\"><div class=\"label\">Partition</div><div class=\"value\">%s</div></div>"
@@ -1624,10 +1705,10 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         running->label,
         ota_state == ESP_OTA_IMG_VALID ? "Valid" :
         ota_state == ESP_OTA_IMG_PENDING_VERIFY ? "Pending" : "New");
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
 
     // Remote update section
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<div id=\"remote-update\" class=\"status-item\" style=\"grid-column:span 2;background:#0f172a\">"
         "<div class=\"flex\" style=\"justify-content:space-between\">"
         "<div><span class=\"label\">Remote Updates</span>"
@@ -1640,20 +1721,20 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         "</div></div><hr>");
 
     // OTA upload form
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<form method=\"POST\" action=\"/ota/upload\" enctype=\"multipart/form-data\">"
         "<div class=\"form-group\"><label class=\"label\">" ICON_UPLOAD " Upload Firmware (.bin)</label>"
         "<input type=\"file\" name=\"firmware\" accept=\".bin\" class=\"mt-1\"></div>"
         "<div class=\"flex\"><button type=\"submit\" class=\"btn btn-primary\">" ICON_UPLOAD " Upload</button>");
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<button type=\"button\" class=\"btn btn-danger\" onclick=\"if(confirm('Rollback to previous partition?'))document.getElementById('rb').submit()\">" ICON_HISTORY " Rollback</button></div>"
         "</form><form id=\"rb\" method=\"POST\" action=\"/ota/rollback\"></form>"
         "<div class=\"alert alert-warn mt-2\">" ICON_WARN " Device will reboot after update</div></div>");
 
     // JavaScript for WiFi scanning and auto-refresh (defined in web_ui.h)
-    httpd_resp_sendstr_chunk(req, WEB_UI_SCRIPT "</div></body></html>");
+    httpd_resp_sendstr_chunk_tr(req, WEB_UI_SCRIPT "</div></body></html>");
 
-    httpd_resp_sendstr_chunk(req, NULL);  // End chunked response
+    httpd_resp_sendstr_chunk_tr(req, NULL);  // End chunked response
     return ESP_OK;
 }
 
@@ -1858,7 +1939,7 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req)
 
     char buf[256];
     char ssid_json[192];
-    httpd_resp_sendstr_chunk(req, "{\"networks\":[");
+    httpd_resp_sendstr_chunk_tr(req, "{\"networks\":[");
 
     for (int i = 0; i < ap_count && ap_list; i++) {
         json_escape_str((const char *)ap_list[i].ssid, ssid_json, sizeof(ssid_json));
@@ -1866,11 +1947,11 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req)
                  i > 0 ? "," : "",
                  ssid_json,
                  ap_list[i].rssi);
-        httpd_resp_sendstr_chunk(req, buf);
+        httpd_resp_sendstr_chunk_tr(req, buf);
     }
 
-    httpd_resp_sendstr_chunk(req, "]}");
-    httpd_resp_sendstr_chunk(req, NULL);
+    httpd_resp_sendstr_chunk_tr(req, "]}");
+    httpd_resp_sendstr_chunk_tr(req, NULL);
 
     if (ap_list) free(ap_list);
 
@@ -2107,6 +2188,48 @@ static esp_err_t reboot_interval_save_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/** Language save handler – NVS only, reboot to apply (no Cookie, no API) */
+static esp_err_t lang_save_handler(httpd_req_t *req)
+{
+    char content[32] = {0};
+    int received = httpd_req_recv(req, content, sizeof(content) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No data");
+        return ESP_FAIL;
+    }
+    content[received] = '\0';
+    char lang_str[8] = {0};
+    form_get(content, "lang", lang_str, sizeof(lang_str));
+    lang_t l = i18n_parse_code(lang_str);
+    if (l == LANG_COUNT) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid language");
+        return ESP_FAIL;
+    }
+    if (i18n_set_lang(l) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save");
+        return ESP_FAIL;
+    }
+    lang_t cur = l;
+    const char *title = i18n_get(cur, "applying_language_title");
+    const char *msg = i18n_get(cur, "applying_language_msg");
+    const char *code = (cur == LANG_DE ? "de" : "en");
+    char html[768];
+    snprintf(html, sizeof(html),
+        "<!DOCTYPE html><html lang=\"%s\"><head><meta charset=\"UTF-8\">"
+        "<meta http-equiv=\"refresh\" content=\"10;url=/\">"
+        "<style>body{font-family:system-ui;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}"
+        ".box{background:#1e293b;padding:2rem;border-radius:0.75rem;text-align:center;border:1px solid #334155}"
+        ".spinner{width:3rem;height:3rem;border:3px solid #334155;border-top:3px solid #3b82f6;border-radius:50%%;animation:spin 1s linear infinite;margin:1rem auto}"
+        "@keyframes spin{to{transform:rotate(360deg)}} a{color:#3b82f6}</style></head>"
+        "<body><div class=\"box\"><div class=\"spinner\"></div><h2>%s</h2><p>%s</p></div></body></html>",
+        code, title, msg);
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html, strlen(html));
+    vTaskDelay(pdMS_TO_TICKS(800));
+    esp_restart();
+    return ESP_OK;
+}
+
 /** API endpoint for status JSON */
 static esp_err_t api_status_handler(httpd_req_t *req)
 {
@@ -2241,7 +2364,7 @@ static esp_err_t api_requests_handler(httpd_req_t *req)
 
     char buf[128];
     snprintf(buf, sizeof(buf), "{\"avg_ttfb\":%lu,\"requests\":[", (unsigned long)proxy_get_avg_ttfb());
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
 
     // Get request log from proxy module
     request_log_entry_t entries[REQUEST_LOG_SIZE];
@@ -2260,11 +2383,11 @@ static esp_err_t api_requests_handler(httpd_req_t *req)
             (long long)age, ip[0], ip[1], ip[2], ip[3],
             (unsigned long)e->bytes_in, (unsigned long)e->bytes_out,
             e->ttfb_ms, e->ttlb_ms, e->result == 0 ? 1 : 0);
-        httpd_resp_sendstr_chunk(req, buf);
+        httpd_resp_sendstr_chunk_tr(req, buf);
     }
 
-    httpd_resp_sendstr_chunk(req, "]}");
-    httpd_resp_sendstr_chunk(req, NULL);
+    httpd_resp_sendstr_chunk_tr(req, "]}");
+    httpd_resp_sendstr_chunk_tr(req, NULL);
     return ESP_OK;
 }
 
@@ -2272,7 +2395,7 @@ static esp_err_t api_requests_handler(httpd_req_t *req)
 static esp_err_t api_logs_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr_chunk(req, "{\"logs\":[");
+    httpd_resp_sendstr_chunk_tr(req, "{\"logs\":[");
 
     if (log_mutex && xSemaphoreTake(log_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         bool first = true;
@@ -2305,14 +2428,14 @@ static esp_err_t api_logs_handler(httpd_req_t *req)
                 "%s{\"ts\":%lld,\"lvl\":%u,\"msg\":\"%s\"}",
                 first ? "" : ",",
                 (long long)e->timestamp, e->level, escaped);
-            httpd_resp_sendstr_chunk(req, buf);
+            httpd_resp_sendstr_chunk_tr(req, buf);
             first = false;
         }
         xSemaphoreGive(log_mutex);
     }
 
-    httpd_resp_sendstr_chunk(req, "]}");
-    httpd_resp_sendstr_chunk(req, NULL);
+    httpd_resp_sendstr_chunk_tr(req, "]}");
+    httpd_resp_sendstr_chunk_tr(req, NULL);
     return ESP_OK;
 }
 
@@ -2334,7 +2457,7 @@ static esp_err_t logs_txt_handler(httpd_req_t *req)
              app ? app->version : "?",
              (long long)(esp_timer_get_time() / 1000000),
              (unsigned long)(esp_get_free_heap_size() / 1024));
-    httpd_resp_sendstr_chunk(req, head);
+    httpd_resp_sendstr_chunk_tr(req, head);
 
     if (log_mutex && xSemaphoreTake(log_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         char line[LOG_MSG_MAX_LEN + 32];
@@ -2344,12 +2467,12 @@ static esp_err_t logs_txt_handler(httpd_req_t *req)
             if (e->timestamp == 0 && e->message[0] == '\0') continue;
             snprintf(line, sizeof(line), "[%llds] %s\n",
                      (long long)e->timestamp, e->message);
-            httpd_resp_sendstr_chunk(req, line);
+            httpd_resp_sendstr_chunk_tr(req, line);
         }
         xSemaphoreGive(log_mutex);
     }
 
-    httpd_resp_sendstr_chunk(req, NULL);
+    httpd_resp_sendstr_chunk_tr(req, NULL);
     return ESP_OK;
 }
 static esp_err_t api_wifi_history_handler(httpd_req_t *req)
@@ -2373,7 +2496,7 @@ static esp_err_t api_wifi_history_handler(httpd_req_t *req)
         summary.current_bucket_index,
         (unsigned long)summary.total_connected_sec,
         (unsigned long)summary.total_disconnected_sec);
-    httpd_resp_sendstr_chunk(req, buf);
+    httpd_resp_sendstr_chunk_tr(req, buf);
 
     // Get history buckets
     wifi_metrics_bucket_t *buckets = malloc(sizeof(wifi_metrics_bucket_t) * WIFI_METRICS_BUCKET_COUNT);
@@ -2394,15 +2517,15 @@ static esp_err_t api_wifi_history_handler(httpd_req_t *req)
                     b->avg_rssi,
                     b->connection_pct,
                     b->sample_count);
-                httpd_resp_sendstr_chunk(req, buf);
+                httpd_resp_sendstr_chunk_tr(req, buf);
                 first = false;
             }
         }
         free(buckets);
     }
 
-    httpd_resp_sendstr_chunk(req, "]}");
-    httpd_resp_sendstr_chunk(req, NULL);
+    httpd_resp_sendstr_chunk_tr(req, "]}");
+    httpd_resp_sendstr_chunk_tr(req, NULL);
     return ESP_OK;
 }
 
@@ -2467,42 +2590,46 @@ static esp_err_t ota_rollback_handler(httpd_req_t *req)
 
 static void send_simple_page_begin(httpd_req_t *req, const char *title)
 {
+    const char *hl = (i18n_get_current() == LANG_DE ? "de" : "en");
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
-    httpd_resp_sendstr_chunk(req,
-        "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    httpd_resp_set_hdr(req, "Content-Language", hl);
+    char head[256];
+    snprintf(head, sizeof(head),
+        "<!DOCTYPE html><html lang=\"%s\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<link rel=\"icon\" type=\"image/png\" href=\"/favicon.ico\">"
         "<link rel=\"apple-touch-icon\" href=\"/apple-touch-icon.png\">"
-        "<title>");
-    httpd_resp_sendstr_chunk(req, title);
-    httpd_resp_sendstr_chunk(req, "</title><style>");
-    httpd_resp_sendstr_chunk(req, DARK_CSS);
-    httpd_resp_sendstr_chunk(req,
+        "<title>", hl);
+    httpd_resp_sendstr_chunk_tr(req, head);
+    httpd_resp_sendstr_chunk_tr(req, title);
+    httpd_resp_sendstr_chunk_tr(req, "</title><style>");
+    httpd_resp_sendstr_chunk_tr(req, DARK_CSS);
+    httpd_resp_sendstr_chunk_tr(req,
         "svg.i{width:1.125rem;height:1.125rem;vertical-align:middle;margin-right:0.25rem;fill:currentColor}"
         "</style></head><body><div class=\"container\"><div class=\"card\">");
 }
 
 static void send_simple_page_end(httpd_req_t *req)
 {
-    httpd_resp_sendstr_chunk(req, "</div></div></body></html>");
-    httpd_resp_sendstr_chunk(req, NULL);
+    httpd_resp_sendstr_chunk_tr(req, "</div></div></body></html>");
+    httpd_resp_sendstr_chunk_tr(req, NULL);
 }
 
 static esp_err_t send_admin_setup_page(httpd_req_t *req, const char *error_msg)
 {
     send_simple_page_begin(req, "Set admin password");
-    httpd_resp_sendstr_chunk(req, "<h1>" ICON_LOCK " Set admin password</h1>");
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req, "<h1>" ICON_LOCK " Set admin password</h1>");
+    httpd_resp_sendstr_chunk_tr(req,
         "<p class=\"text-sm text-muted\" style=\"margin-bottom:1rem\">"
         "Protects the dashboard, WiFi/Ethernet settings, and firmware updates. "
         "The Powerwall data stream on port 443 is not affected. "
         "Username is <code>" ADMIN_USERNAME "</code>.</p>");
     if (error_msg && error_msg[0]) {
-        httpd_resp_sendstr_chunk(req, "<div class=\"alert alert-warn\" style=\"margin-bottom:0.75rem\">" ICON_WARN " ");
-        httpd_resp_sendstr_chunk(req, error_msg);
-        httpd_resp_sendstr_chunk(req, "</div>");
+        httpd_resp_sendstr_chunk_tr(req, "<div class=\"alert alert-warn\" style=\"margin-bottom:0.75rem\">" ICON_WARN " ");
+        httpd_resp_sendstr_chunk_tr(req, error_msg);
+        httpd_resp_sendstr_chunk_tr(req, "</div>");
     }
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<form method=\"POST\" action=\"/admin/setup\">"
         "<div class=\"form-group\"><label class=\"label\">Password (min 8 characters)</label>"
         "<input type=\"password\" name=\"password\" minlength=\"8\" maxlength=\"64\" required autocomplete=\"new-password\" class=\"mt-1\"></div>"
@@ -2517,13 +2644,13 @@ static esp_err_t send_admin_setup_page(httpd_req_t *req, const char *error_msg)
 static esp_err_t send_login_page(httpd_req_t *req, const char *error_msg)
 {
     send_simple_page_begin(req, "Sign in");
-    httpd_resp_sendstr_chunk(req, "<h1>" ICON_LOCK " Sign in</h1>");
+    httpd_resp_sendstr_chunk_tr(req, "<h1>" ICON_LOCK " Sign in</h1>");
     if (error_msg && error_msg[0]) {
-        httpd_resp_sendstr_chunk(req, "<div class=\"alert alert-warn\" style=\"margin-bottom:0.75rem\">" ICON_WARN " ");
-        httpd_resp_sendstr_chunk(req, error_msg);
-        httpd_resp_sendstr_chunk(req, "</div>");
+        httpd_resp_sendstr_chunk_tr(req, "<div class=\"alert alert-warn\" style=\"margin-bottom:0.75rem\">" ICON_WARN " ");
+        httpd_resp_sendstr_chunk_tr(req, error_msg);
+        httpd_resp_sendstr_chunk_tr(req, "</div>");
     }
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<form method=\"POST\" action=\"/login\">"
         "<div class=\"form-group\"><label class=\"label\">Username — " ADMIN_USERNAME "</label>"
         "<input type=\"text\" name=\"username\" value=\"" ADMIN_USERNAME "\" autocomplete=\"username\" required class=\"mt-1\"></div>"
@@ -2723,8 +2850,8 @@ static esp_err_t admin_setup_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Set-Cookie", cookie);
 
     send_simple_page_begin(req, "Password saved");
-    httpd_resp_sendstr_chunk(req, "<h1>" ICON_LOCK " Password saved</h1>");
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req, "<h1>" ICON_LOCK " Password saved</h1>");
+    httpd_resp_sendstr_chunk_tr(req,
         "<p>You are signed in as <code>" ADMIN_USERNAME "</code>.</p>"
         "<p class=\"text-xs text-muted\" style=\"margin:0.75rem 0\">"
         "If you forget the password, hold BOOT for 15 seconds to clear it (also forces DHCP).</p>"
@@ -2770,9 +2897,9 @@ static esp_err_t admin_password_handler(httpd_req_t *req)
         memset(password, 0, sizeof(password));
         memset(password2, 0, sizeof(password2));
         send_simple_page_begin(req, "Password not changed");
-        httpd_resp_sendstr_chunk(req, "<h1>" ICON_WARN " Password not changed</h1><p>");
-        httpd_resp_sendstr_chunk(req, err);
-        httpd_resp_sendstr_chunk(req, "</p><p><a href=\"/\">Back</a></p>");
+        httpd_resp_sendstr_chunk_tr(req, "<h1>" ICON_WARN " Password not changed</h1><p>");
+        httpd_resp_sendstr_chunk_tr(req, err);
+        httpd_resp_sendstr_chunk_tr(req, "</p><p><a href=\"/\">Back</a></p>");
         send_simple_page_end(req);
         return ESP_OK;
     }
@@ -2793,7 +2920,7 @@ static esp_err_t admin_password_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Set-Cookie", cookie);
 
     send_simple_page_begin(req, "Password changed");
-    httpd_resp_sendstr_chunk(req,
+    httpd_resp_sendstr_chunk_tr(req,
         "<h1>" ICON_LOCK " Password changed</h1>"
         "<p>Other sessions were signed out. This browser stays signed in.</p>"
         "<p><a class=\"btn btn-primary\" href=\"/\" style=\"display:inline-block;text-decoration:none;margin-top:0.75rem\">Back to dashboard</a></p>");
@@ -2863,7 +2990,7 @@ static esp_err_t start_http_server(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = WEB_HTTP_PORT;
     config.stack_size = 8192;
-    config.max_uri_handlers = 29;
+    config.max_uri_handlers = 32;
     config.lru_purge_enable = true;
     config.open_fn = http_open_fn;
 
@@ -2935,6 +3062,7 @@ static esp_err_t start_http_server(void)
     AUTH_URI("/api/revert", HTTP_POST, api_revert_handler);
     AUTH_URI("/admin/setup", HTTP_POST, admin_setup_handler);
     AUTH_URI("/admin/password", HTTP_POST, admin_password_handler);
+    AUTH_URI("/lang", HTTP_POST, lang_save_handler);
 
 #undef AUTH_URI
 
@@ -3500,6 +3628,7 @@ void app_main(void)
 
     load_admin_config();
     load_reboot_config();
+    i18n_load_lang();
     init_temp_sensor();
     sample_chip_temp();
 
