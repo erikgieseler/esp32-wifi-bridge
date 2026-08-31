@@ -159,4 +159,4 @@ Tags `v*` build firmware, GitHub Release, and Pages. Flash wear: OTA alternates 
 
 ## License
 
-Provided as-is for ESP32-S3-POE-ETH hardware. Fork of [mccahan/esp32-wifi-bridge](https://github.com/mccahan/esp32-wifi-bridge).
+Provided as-is for ESP32-S3-POE-ETH hardware. Fork of [cwagz/esp32-wifi-bridge](https://github.com/cwagz/esp32-wifi-bridge).
