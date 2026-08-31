@@ -14,7 +14,7 @@ Neither port is bound on the Tesla Wi-Fi address.
 
 Browser flash (Chrome, Edge, or Opera) from GitHub Pages:
 
-**https://cwagz.github.io/esp32-wifi-bridge/**
+**https://erikgieseler.github.io/esp32-wifi-bridge/**
 
 USB to the board, click **Install**. Tagged CI publishes `firmware.bin` and `version.json` there. Remote OTA uses the same URL. Enable **Settings → Pages → Deploy from a branch → `gh-pages`**. Forks do not need `config.local.h`.
 
