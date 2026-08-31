@@ -188,7 +188,7 @@
 // https://<owner>.github.io/<repo>/version.json. Override in config.local.h
 // only if you host OTA somewhere else.
 #ifndef REMOTE_OTA_VERSION_URL
-#define REMOTE_OTA_VERSION_URL "https://mccahan.github.io/esp32-wifi-bridge/version.json"
+#define REMOTE_OTA_VERSION_URL "https://erikgieseler.github.io/esp32-wifi-bridge/version.json"
 #endif
 
 // ===== Admin Web UI =====
