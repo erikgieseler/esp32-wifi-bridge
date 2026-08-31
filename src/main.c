@@ -2525,7 +2525,7 @@ static esp_err_t send_login_page(httpd_req_t *req, const char *error_msg)
     }
     httpd_resp_sendstr_chunk(req,
         "<form method=\"POST\" action=\"/login\">"
-        "<div class=\"form-group\"><label class=\"label\">Username</label>"
+        "<div class=\"form-group\"><label class=\"label\">Username — " ADMIN_USERNAME "</label>"
         "<input type=\"text\" name=\"username\" value=\"" ADMIN_USERNAME "\" autocomplete=\"username\" required class=\"mt-1\"></div>"
         "<div class=\"form-group\"><label class=\"label\">Password</label>"
         "<input type=\"password\" name=\"password\" autocomplete=\"current-password\" required class=\"mt-1\"></div>"
