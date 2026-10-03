@@ -14,7 +14,7 @@
 
 #define ICON_WIFI "<svg class=\"i\" viewBox=\"0 0 24 24\"><path d=\"M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4l2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z\"/></svg>"
 
-#define ICON_SIGNAL "<svg class=\"i\" viewBox=\"0 0 24 24\"><path d=\"M2 22h20V2L2 22z\"/></svg>"
+#define ICON_SIGNAL "<svg id=\"sigico\" class=\"i sig-bars\" data-n=\"0\" viewBox=\"0 0 24 24\"><rect class=\"sig-bar\" x=\"3\" y=\"14\" width=\"3.5\" height=\"7\" rx=\".8\"/><rect class=\"sig-bar\" x=\"8\" y=\"10\" width=\"3.5\" height=\"11\" rx=\".8\"/><rect class=\"sig-bar\" x=\"13\" y=\"6\" width=\"3.5\" height=\"15\" rx=\".8\"/><rect class=\"sig-bar\" x=\"18\" y=\"2\" width=\"3.5\" height=\"19\" rx=\".8\"/></svg>"
 
 #define ICON_BATTERY "<svg class=\"i\" viewBox=\"0 0 24 24\"><path d=\"M16 4h-2V2h-4v2H8C6.9 4 6 4.9 6 6v14c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 16H8V6h8v14z\"/></svg>"
 
@@ -110,7 +110,13 @@ static const char *DARK_CSS =
     ".chart-container canvas{display:block;width:100%;height:100%}"
     ".chart-legend{display:flex;gap:1rem;justify-content:center;margin-top:0.5rem;font-size:0.75rem}"
     ".chart-legend span{display:flex;align-items:center;gap:0.25rem}"
-    ".chart-legend .dot{width:8px;height:8px;border-radius:50%}";
+    ".chart-legend .dot{width:8px;height:8px;border-radius:50%}"
+    "svg.sig-bars{fill:none}"
+    "svg.sig-bars .sig-bar{fill:#334155}"
+    "svg.sig-bars[data-n=\"1\"] .sig-bar:nth-child(1){fill:currentColor}"
+    "svg.sig-bars[data-n=\"2\"] .sig-bar:nth-child(-n+2){fill:currentColor}"
+    "svg.sig-bars[data-n=\"3\"] .sig-bar:nth-child(-n+3){fill:currentColor}"
+    "svg.sig-bars[data-n=\"4\"] .sig-bar{fill:currentColor}";
 
 // ===== JavaScript for Auto-refresh =====
 
@@ -126,11 +132,16 @@ static const char *DARK_CSS =
     "if(!s.options.length)fillSel(s,'No networks');" \
     "}).catch(e=>{fillSel(s,'Scan failed');});}" \
     "function sigQ(r){return r>-50?'Excellent':r>-60?'Good':r>-70?'Fair':'Weak';}" \
+    "function sigBars(r){return r>-50?4:r>-60?3:r>-70?2:1;}" \
+    "function setSigIco(n,c){var i=document.getElementById('sigico');if(!i)return;i.setAttribute('data-n',''+n);i.style.color=c||'#475569';}" \
     "function fmtAge(s){return s>=3600?Math.floor(s/3600)+'h':s>=60?Math.floor(s/60)+'m':s+'s';}" \
     "function fmtBytes(b){if(b>=1073741824)return(b/1073741824).toFixed(1)+' GB';" \
     "if(b>=1048576)return(b/1048576).toFixed(1)+' MB';if(b>=1024)return(b/1024).toFixed(1)+' KB';return b+' B';}" \
     "function fmtUptime(s){var d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60;" \
     "return d+'d '+h+'h '+m+'m '+sec+'s';}" \
+    "function fmtDur(s){s=Math.floor(s||0);if(s<3600)return Math.floor(s/60)+'m';" \
+    "if(s<86400){var h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return m?h+'h '+m+'m':h+'h';}" \
+    "var d=Math.floor(s/86400),h=Math.floor((s%86400)/3600);return h?d+'d '+h+'h':d+'d';}" \
     "var lastOk=Date.now(),fetching=false,dashDown=false;" \
     "function updAge(){var s=Math.floor((Date.now()-lastOk)/1000);var el=document.getElementById('lastref');" \
     "if(s>30){el.innerHTML='<span style=\"color:#ef4444\">'+s+'s ago (stale)</span>';}else{el.textContent=s+'s ago';}}" \
@@ -146,18 +157,23 @@ static const char *DARK_CSS =
     ".then(function(d){if(dashDown){location.reload();return;}fetching=false;lastOk=Date.now();" \
     "var st=d[0],r=st.wifi.rssi,sigEl=document.getElementById('sig');" \
     "if(r){var sc=r>-50?'#22c55e':r>-60?'#84cc16':r>-70?'#eab308':'#ef4444';" \
-    "sigEl.innerHTML='<span style=\"color:'+sc+'\">'+r+' dBm ('+sigQ(r)+')</span>';}else{sigEl.textContent='-';}" \
+    "setSigIco(sigBars(r),sc);" \
+    "sigEl.innerHTML='<span style=\"color:'+sc+'\">'+r+' dBm ('+sigQ(r)+')</span>';}else{setSigIco(0,'#475569');sigEl.textContent='-';}" \
     "document.getElementById('cpu').textContent=st.cpu+'%';" \
     "var tEl=document.getElementById('temp');" \
     "if(tEl){if(st.temp_c==null||typeof st.temp_c!=='number'){tEl.textContent='—';tEl.style.color='#94a3b8';}" \
     "else{tEl.textContent=st.temp_c.toFixed(1)+' °C';" \
     "tEl.style.color=st.temp_c>=80?'#ef4444':st.temp_c>=65?'#eab308':'#22c55e';}}" \
     "var wEl=document.getElementById('wdog');" \
-    "if(wEl&&st.watchdog){var w=st.watchdog;" \
+    "if(wEl&&st.watchdog){var w=st.watchdog,lim=w.timeout_s||600;" \
+    "function wdColor(ws){return ws>=lim*0.9?'#ef4444':ws>=lim*0.75?'#eab308':'#22c55e';}" \
+    "function wdAge(ws){return ws>=60?Math.floor(ws/60)+'m':ws+'s';}" \
+    "if(w.mode==='link'){" \
     "if(!w.armed){wEl.textContent='Idle';wEl.style.color='#94a3b8';}" \
-    "else{var ws=w.last_s||0,lim=w.timeout_s||600;" \
-    "wEl.textContent=ws>=60?'Armed · '+Math.floor(ws/60)+'m':'Armed · '+ws+'s';" \
-    "wEl.style.color=ws>=lim*0.9?'#ef4444':ws>=lim*0.75?'#eab308':'#22c55e';}}" \
+    "else if(w.link_up){wEl.textContent='Link up';wEl.style.color='#22c55e';}" \
+    "else{var ws=w.last_s||0;wEl.textContent='Link down · '+wdAge(ws);wEl.style.color=wdColor(ws);}" \
+    "}else if(!w.armed){wEl.textContent='Idle';wEl.style.color='#94a3b8';}" \
+    "else{var ws=w.last_s||0;wEl.textContent='Armed · '+wdAge(ws);wEl.style.color=wdColor(ws);}}" \
     "if(st.eth){var e1=document.getElementById('ethip');if(e1)e1.textContent=st.eth.ip||'N/A';" \
     "var e2=document.getElementById('ethip2');if(e2)e2.textContent=st.eth.ip||'N/A';}" \
     "document.getElementById('uptime').textContent=fmtUptime(st.uptime);" \
@@ -258,7 +274,7 @@ static const char *DARK_CSS =
     "var info=document.getElementById('wifiinfo');if(info){" \
     "var csec=d.connected_sec,dsec=d.disconnected_sec,total=csec+dsec;" \
     "var upPct=total>0?Math.round(csec*100/total):0;" \
-    "info.innerHTML='<span>Uptime: '+upPct+'%</span><span>Connected: '+Math.floor(csec/60)+'m</span><span>Disconnected: '+Math.floor(dsec/60)+'m</span>'+" \
+    "info.innerHTML='<span>Uptime: '+upPct+'%</span><span>Connected: '+fmtDur(csec)+'</span><span>Disconnected: '+fmtDur(dsec)+'</span>'+" \
     "(d.time_synced?'<span style=\"color:#22c55e\">NTP synced</span>':'<span style=\"color:#eab308\">NTP pending</span>');}" \
     "}).catch(function(e){console.log('Chart error:',e);});}" \
     "drawWifiChart();setInterval(drawWifiChart,60000);" \

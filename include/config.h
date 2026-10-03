@@ -133,12 +133,18 @@
 #endif
 
 // ===== Connection Watchdog =====
-// Reboot device if no successful proxy connections within this time
+// Proxy-clients mode: reboot if no successful proxy within this time (after the first one).
+// Powerwall-link mode: reboot if the Powerwall stays unreachable for this long.
 #ifndef WATCHDOG_TIMEOUT_SEC
 #define WATCHDOG_TIMEOUT_SEC 600  // 10 minutes
 #endif
 #ifndef WATCHDOG_CHECK_INTERVAL_SEC
 #define WATCHDOG_CHECK_INTERVAL_SEC 60  // Check every minute
+#endif
+// Powerwall-link mode only. TCP probe of 192.168.91.1:443.
+// Dashboard refresh reuses the last result until this age.
+#ifndef WATCHDOG_LINK_PROBE_SEC
+#define WATCHDOG_LINK_PROBE_SEC 300  // 5 minutes
 #endif
 
 // ===== Auto Reboot (interval) =====

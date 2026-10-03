@@ -58,14 +58,20 @@ Put the dashboard behind TLS if you want HTTPS: HAProxy (or similar) to `:80`. H
 | INT | 10 |
 | BOOT (hold 15 s) | 0 |
 
+### Printed case
+
+A snap-fit ASA enclosure (no supports) with a wall mount is in [`case/`](case/). Vents are meant for **horizontal** wall install so heat rises through the grille.
+
+![Case](case/photos/04_ethernet.jpg)
+
 ## Features
 
 - SSL/TLS **passthrough** to `192.168.91.1:443` with **TTL 64**
 - Ethernet **DHCP** or **static IP** (NVS); 45 s gateway-unreachable fallback to DHCP (saved static kept)
 - HTTP and proxy **bound to the Ethernet IP only**
 - mDNS `powerwall.local` (`_powerwall._tcp` :443, `_http._tcp` :80)
-- Admin password: salted SHA-256 in NVS, HTML form, session cookie (`HttpOnly; SameSite=Strict`; `Secure` when `X-Forwarded-Proto: https`)
-- Watchdog: idle until the first successful Powerwall proxy, then reboot after 10 min without one
+- Admin password: salted SHA-256 in NVS, HTML form, session cookie (`HttpOnly; SameSite=Lax`; `Secure` when `X-Forwarded-Proto: https`)
+- Watchdog with two triggers (see below). Default is unchanged.
 - NTP over Ethernet, OTA from GitHub Pages, Ethernet DNS snapshot so Wi-Fi cannot steal OTA DNS
 
 ## Reverse proxy (HAProxy)
@@ -102,6 +108,7 @@ First boot: set password. Later: **Username — admin**. Port 443 is not this lo
 | `GET /wifi/scan` | session | Scan SSIDs |
 | `POST /wifi/save` | session | Save Wi-Fi |
 | `POST /eth/save` | session | Save Ethernet (reboots) |
+| `POST /watchdog/save` | session | `mode=proxy` or `mode=link` (no reboot) |
 | `POST /admin/setup` | first boot | Set password |
 | `POST /admin/password` | session | Change password |
 | `POST /ota/upload` | session | Upload `.bin` |
@@ -119,9 +126,22 @@ Unauthenticated page requests redirect to `/login`. APIs return JSON `401`.
 
 Stored as salt + SHA-256 in NVS, not in the firmware image. Change it from the System card (collapsed). Reboot/OTA drops RAM sessions; the cookie may still be in the browser until you sign in again.
 
+### Watchdog
+
+Click the **Watchdog** tile on the System card. Pick a trigger and **Save**. The device does not reboot. The choice is stored in NVS, survives OTA, and is not cleared by the 15-second BOOT hold.
+
+| Trigger | When to use it | What it does |
+|---|---|---|
+| **Proxy clients** (default) | This bridge is the path clients use to reach the Powerwall | Stays **Idle** until the first successful proxy. Then reboots if no client completes a proxy for 10 minutes. |
+| **Powerwall link** | Another path on the LAN reaches the gateway and this bridge is only a fallback | Ignores whether anyone is using the proxy. Reboots only if `192.168.91.1:443` stays unreachable for 10 minutes. |
+
+The 10-minute clock in Powerwall link mode does not start until Wi-Fi has associated at least once, so boot is not treated as a failure. Reachability is a short TCP connect to `192.168.91.1:443` every **5 minutes** (not while the dashboard is merely refreshing). The tile keeps the last result. One extra check runs before a reboot, so a link that recovered is not reset by a stale failure. The tile shows **Link up**, or **Link down** with how long it has been down (yellow, then red, as it nears 10 minutes). If the Powerwall is actually off, the bridge will reboot about 10–15 minutes after it stops answering, then every 10 minutes until it answers again. A reboot cannot bring the gateway back. Proxy clients mode is unchanged: no probe unless the dashboard is open, and then about every 5 seconds.
+
+Switching back to **Proxy clients** disarms the watchdog until the next successful proxy, so an old idle stretch does not reboot the device immediately.
+
 ## Configuration
 
-Compile-time defaults live in [`include/config.h`](include/config.h). Runtime Wi-Fi, Ethernet IP, and the admin password are NVS (dashboard), not git.
+Compile-time defaults live in [`include/config.h`](include/config.h). Runtime Wi-Fi, Ethernet IP, watchdog trigger, and the admin password are NVS (dashboard), not git.
 
 OTA URL is derived from the GitHub remote at build time (`https://<owner>.github.io/<repo>/version.json`). Optional gitignored overrides: copy [`include/config.local.h.example`](include/config.local.h.example) to `include/config.local.h`.
 
@@ -156,6 +176,7 @@ Tags `v*` build firmware, GitHub Release, and Pages. Flash wear: OTA alternates 
 | `include/config.h` | Compile-time constants |
 | `include/web_ui.h` | CSS / JS / icons |
 | `partitions.csv` | nvs 24 KB, dual 1.75 MB OTA slots |
+| `case/` | ASA enclosure STLs + print notes |
 
 ## License
 
